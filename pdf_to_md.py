@@ -551,7 +551,8 @@ def test_setup():
     # Check pdf2image
     try:
         import pdf2image
-        console.print(f"[green]✓[/green] pdf2image is installed (v{pdf2image.__version__})")
+        from importlib.metadata import version
+        console.print(f"[green]✓[/green] pdf2image is installed (v{version('pdf2image')})")
     except ImportError:
         console.print("[red]✗[/red] pdf2image is NOT installed")
         console.print("  Install with: pip install pdf2image")
@@ -569,7 +570,7 @@ def test_setup():
     # Check rich (we're using it, so it must be installed)
     try:
         import rich
-        console.print(f"[green]✓[/green] rich is installed (v{rich.__version__})")
+        console.print(f"[green]✓[/green] rich is installed (v{version('rich')})")
     except ImportError:
         console.print("[red]✗[/red] rich is NOT installed")
         all_good = False
