@@ -3,40 +3,33 @@
 PDF-to-Obsidian Converter
 =========================
 
-A high-fidelity PDF to Markdown converter using Claude Vision API.
+A PDF to Markdown converter using Tesseract OCR.
 
 This tool converts PDF documents to clean, Obsidian-optimized Markdown by:
 1. Converting PDF pages to high-resolution images
-2. Sending images to Claude 3.5 Sonnet for intelligent OCR
-3. Aggregating results with smart page-boundary handling
+2. Running Tesseract OCR on each page
+3. Aggregating results into a single Markdown file
 
 Requirements:
     - Python 3.9+
     - poppler-utils (system package for pdf2image)
-    - Anthropic API key
+    - tesseract (system package for OCR)
+    - pytesseract (Python wrapper)
 
 Usage:
     python pdf_to_md.py --input document.pdf --output document.md
 
-    # Or with explicit API key:
-    python pdf_to_md.py --input document.pdf --output document.md --api-key sk-ant-...
-
 Author: Generated for Obsidian vault optimization
 """
 
-import base64
-import io
-import os
-import sys
 import shutil
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
+from rich.prompt import Confirm
 
 # Initialize Rich console for pretty output
 console = Console()
@@ -44,35 +37,9 @@ console = Console()
 # Create Typer app with rich markup support
 app = typer.Typer(
     name="pdf-to-md",
-    help="High-fidelity PDF to Markdown converter using Claude Vision API.",
+    help="PDF to Markdown converter using Tesseract OCR.",
     rich_markup_mode="rich",
 )
-
-
-# =============================================================================
-# SYSTEM PROMPT - The "Brain" of the OCR
-# =============================================================================
-# This prompt is sent to Claude with each page image. Modify this to adjust
-# the extraction behavior and formatting preferences.
-# =============================================================================
-
-SYSTEM_PROMPT = """Perform a high-fidelity OCR on the attached image. Extract the full, verbatim text.
-
-**Formatting Constraints:**
-* **No System Tags:** Do not include `[PAGE 1]`, `[end]`, or metadata tags.
-* **Clean Typography:** Use standard Markdown. Convert fancy quotes to straight quotes if necessary, but prefer author's original typography.
-* **Structure:** Use appropriate Markdown headers (#, ##) for titles/sections.
-* **Footnotes:** You MUST detect footnotes. Convert them to standard Markdown syntax (e.g., `[^1]` in-text and `[^1]: Content` at the bottom of the text block).
-* **No Truncation:** Extract every single word. Do not summarize."""
-
-
-# Context continuation prompt - appended when we have previous page context
-CONTEXT_CONTINUATION_PROMPT = """
-
-**Page Continuity Context:**
-The previous page ended with these words: "{last_words}"
-
-If the current page begins mid-sentence or continues a thought from these words, seamlessly continue the text without duplicating these words. Ensure proper sentence flow across page boundaries."""
 
 
 # =============================================================================
@@ -92,88 +59,14 @@ def check_poppler_installed() -> bool:
     return shutil.which("pdftoppm") is not None
 
 
-def get_api_key(provided_key: Optional[str] = None) -> str:
+def check_tesseract_installed() -> bool:
     """
-    Get the Anthropic API key from various sources.
-
-    Priority order:
-    1. Explicitly provided key (--api-key flag)
-    2. ANTHROPIC_API_KEY environment variable
-    3. Interactive prompt
-
-    Args:
-        provided_key: API key provided via command line argument.
+    Check if tesseract is installed on the system.
 
     Returns:
-        str: The API key.
-
-    Raises:
-        typer.Exit: If no API key can be obtained.
+        bool: True if tesseract is installed, False otherwise.
     """
-    # Check provided key first
-    if provided_key:
-        return provided_key
-
-    # Check environment variable
-    env_key = os.environ.get("ANTHROPIC_API_KEY")
-    if env_key:
-        console.print("[dim]Using API key from ANTHROPIC_API_KEY environment variable[/dim]")
-        return env_key
-
-    # Interactive prompt as last resort
-    console.print(Panel(
-        "[yellow]No Anthropic API key found![/yellow]\n\n"
-        "You can provide it via:\n"
-        "  1. --api-key flag\n"
-        "  2. ANTHROPIC_API_KEY environment variable\n"
-        "  3. Enter it below",
-        title="API Key Required"
-    ))
-
-    api_key = Prompt.ask("Enter your Anthropic API key", password=True)
-
-    if not api_key:
-        console.print("[red]Error: API key is required to proceed.[/red]")
-        raise typer.Exit(code=1)
-
-    return api_key
-
-
-def image_to_base64(image) -> str:
-    """
-    Convert a PIL Image to a base64-encoded string.
-
-    Args:
-        image: PIL Image object.
-
-    Returns:
-        str: Base64-encoded image data.
-    """
-    buffer = io.BytesIO()
-    # Save as PNG for lossless quality
-    image.save(buffer, format="PNG")
-    buffer.seek(0)
-    return base64.standard_b64encode(buffer.read()).decode("utf-8")
-
-
-def get_last_n_words(text: str, n: int = 50) -> str:
-    """
-    Extract the last N words from a text string.
-
-    Used for passing context between pages to ensure smooth
-    sentence continuation across page boundaries.
-
-    Args:
-        text: The text to extract from.
-        n: Number of words to extract (default: 50).
-
-    Returns:
-        str: The last N words of the text.
-    """
-    words = text.split()
-    if len(words) <= n:
-        return text
-    return " ".join(words[-n:])
+    return shutil.which("tesseract") is not None
 
 
 def clean_page_join(accumulated_text: str, new_page_text: str) -> str:
@@ -246,65 +139,29 @@ def convert_pdf_to_images(pdf_path: Path, dpi: int = 300):
         raise typer.Exit(code=1)
 
 
-def extract_text_from_image(
-    client,
-    image,
-    page_num: int,
-    total_pages: int,
-    previous_context: Optional[str] = None,
-    model: str = "claude-sonnet-4-20250514"
-) -> str:
+def extract_text_from_image(image, page_num: int, lang: str = "eng") -> str:
     """
-    Send an image to Claude Vision API and extract text.
+    Extract text from an image using Tesseract OCR.
 
     Args:
-        client: Anthropic client instance.
         image: PIL Image object.
-        page_num: Current page number (1-indexed).
-        total_pages: Total number of pages.
-        previous_context: Last ~50 words from previous page for continuity.
-        model: Claude model to use.
+        page_num: Current page number (1-indexed, for error messages).
+        lang: Tesseract language code (default: "eng").
 
     Returns:
         str: Extracted text from the image.
     """
-    # Convert image to base64
-    image_data = image_to_base64(image)
-
-    # Build the prompt
-    prompt = SYSTEM_PROMPT
-    if previous_context:
-        prompt += CONTEXT_CONTINUATION_PROMPT.format(last_words=previous_context)
-
-    # Create the message with image
     try:
-        message = client.messages.create(
-            model=model,
-            max_tokens=8192,  # Allow for long pages
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": image_data,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": prompt,
-                        },
-                    ],
-                }
-            ],
-        )
+        import pytesseract
+    except ImportError:
+        console.print("[red]Error: pytesseract is not installed.[/red]")
+        console.print("Install it with: pip install pytesseract")
+        raise typer.Exit(code=1)
 
-        # Extract the text response
-        return message.content[0].text
-
+    try:
+        # Run Tesseract OCR on the image
+        text = pytesseract.image_to_string(image, lang=lang)
+        return text.strip()
     except Exception as e:
         console.print(f"[red]Error on page {page_num}: {e}[/red]")
         return f"[Error extracting page {page_num}: {str(e)}]"
@@ -334,12 +191,6 @@ def convert(
         dir_okay=False,
         resolve_path=True,
     ),
-    api_key: Optional[str] = typer.Option(
-        None,
-        "--api-key", "-k",
-        help="Anthropic API key. Can also use ANTHROPIC_API_KEY env var.",
-        envvar="ANTHROPIC_API_KEY",
-    ),
     dpi: int = typer.Option(
         300,
         "--dpi", "-d",
@@ -347,17 +198,10 @@ def convert(
         min=72,
         max=600,
     ),
-    model: str = typer.Option(
-        "claude-sonnet-4-20250514",
-        "--model", "-m",
-        help="Claude model to use for OCR.",
-    ),
-    context_words: int = typer.Option(
-        50,
-        "--context-words", "-c",
-        help="Number of words to pass as context between pages.",
-        min=0,
-        max=200,
+    lang: str = typer.Option(
+        "eng",
+        "--lang", "-l",
+        help="Tesseract language code (e.g., 'eng', 'deu', 'fra'). Use 'tesseract --list-langs' to see available.",
     ),
     force: bool = typer.Option(
         False,
@@ -368,8 +212,7 @@ def convert(
     """
     Convert a PDF document to Obsidian-optimized Markdown.
 
-    This tool uses Claude Vision API to perform high-fidelity OCR,
-    preserving complex layouts, footnotes, and typography.
+    This tool uses Tesseract OCR to extract text from PDF pages.
 
     Example:
         python pdf_to_md.py -i document.pdf -o document.md
@@ -381,7 +224,7 @@ def convert(
 
     console.print(Panel(
         "[bold blue]PDF-to-Obsidian Converter[/bold blue]\n"
-        "High-fidelity OCR using Claude Vision API",
+        "OCR using Tesseract",
         title="Starting Conversion"
     ))
 
@@ -400,29 +243,26 @@ def convert(
 
     console.print("[green]✓[/green] poppler-utils detected")
 
+    # Check for tesseract
+    if not check_tesseract_installed():
+        console.print(Panel(
+            "[red bold]tesseract is not installed![/red bold]\n\n"
+            "This tool requires Tesseract for OCR.\n\n"
+            "[yellow]Installation instructions:[/yellow]\n"
+            "  • Ubuntu/Debian: sudo apt-get install tesseract-ocr\n"
+            "  • macOS: brew install tesseract\n"
+            "  • Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki",
+            title="Missing Dependency"
+        ))
+        raise typer.Exit(code=1)
+
+    console.print("[green]✓[/green] tesseract detected")
+
     # Check output file
     if output_path.exists() and not force:
         if not Confirm.ask(f"Output file {output_path} exists. Overwrite?"):
             console.print("[yellow]Aborted.[/yellow]")
             raise typer.Exit(code=0)
-
-    # Get API key
-    resolved_api_key = get_api_key(api_key)
-    console.print("[green]✓[/green] API key configured")
-
-    # Initialize Anthropic client
-    try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=resolved_api_key)
-    except ImportError:
-        console.print("[red]Error: anthropic library is not installed.[/red]")
-        console.print("Install it with: pip install anthropic")
-        raise typer.Exit(code=1)
-    except Exception as e:
-        console.print(f"[red]Error initializing Anthropic client: {e}[/red]")
-        raise typer.Exit(code=1)
-
-    console.print("[green]✓[/green] Anthropic client initialized")
 
     # ==========================================================================
     # STEP 2: Convert PDF to Images
@@ -443,13 +283,12 @@ def convert(
     console.print(f"[green]✓[/green] Converted {total_pages} page(s) to images")
 
     # ==========================================================================
-    # STEP 3: OCR Each Page with Claude
+    # STEP 3: OCR Each Page with Tesseract
     # ==========================================================================
 
-    console.print(f"\n[bold]Extracting text using {model}...[/bold]")
+    console.print(f"\n[bold]Extracting text using Tesseract (lang={lang})...[/bold]")
 
     accumulated_text = ""
-    previous_context = None
 
     with Progress(
         SpinnerColumn(),
@@ -466,20 +305,13 @@ def convert(
 
             # Extract text from this page
             page_text = extract_text_from_image(
-                client=client,
                 image=image,
                 page_num=page_num,
-                total_pages=total_pages,
-                previous_context=previous_context if context_words > 0 else None,
-                model=model,
+                lang=lang,
             )
 
             # Join with accumulated text
             accumulated_text = clean_page_join(accumulated_text, page_text)
-
-            # Update context for next page
-            if context_words > 0:
-                previous_context = get_last_n_words(page_text, context_words)
 
             progress.update(task, advance=1)
 
@@ -531,13 +363,15 @@ def test_setup():
 
     This command checks for:
     - poppler-utils (system)
+    - tesseract (system)
     - pdf2image (Python)
-    - anthropic (Python)
+    - pytesseract (Python)
     - rich (Python)
     """
     console.print("[bold]Testing PDF-to-Obsidian Setup[/bold]\n")
 
     all_good = True
+    from importlib.metadata import version
 
     # Check poppler
     if check_poppler_installed():
@@ -548,23 +382,31 @@ def test_setup():
         console.print("  Install with: brew install poppler (macOS)")
         all_good = False
 
+    # Check tesseract
+    if check_tesseract_installed():
+        console.print("[green]✓[/green] tesseract is installed")
+    else:
+        console.print("[red]✗[/red] tesseract is NOT installed")
+        console.print("  Install with: sudo apt-get install tesseract-ocr (Linux)")
+        console.print("  Install with: brew install tesseract (macOS)")
+        all_good = False
+
     # Check pdf2image
     try:
         import pdf2image
-        from importlib.metadata import version
         console.print(f"[green]✓[/green] pdf2image is installed (v{version('pdf2image')})")
     except ImportError:
         console.print("[red]✗[/red] pdf2image is NOT installed")
         console.print("  Install with: pip install pdf2image")
         all_good = False
 
-    # Check anthropic
+    # Check pytesseract
     try:
-        import anthropic
-        console.print(f"[green]✓[/green] anthropic is installed (v{anthropic.__version__})")
+        import pytesseract
+        console.print(f"[green]✓[/green] pytesseract is installed (v{version('pytesseract')})")
     except ImportError:
-        console.print("[red]✗[/red] anthropic is NOT installed")
-        console.print("  Install with: pip install anthropic")
+        console.print("[red]✗[/red] pytesseract is NOT installed")
+        console.print("  Install with: pip install pytesseract")
         all_good = False
 
     # Check rich (we're using it, so it must be installed)
@@ -574,14 +416,6 @@ def test_setup():
     except ImportError:
         console.print("[red]✗[/red] rich is NOT installed")
         all_good = False
-
-    # Check API key
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key:
-        console.print("[green]✓[/green] ANTHROPIC_API_KEY environment variable is set")
-    else:
-        console.print("[yellow]![/yellow] ANTHROPIC_API_KEY environment variable is not set")
-        console.print("  You can still provide it via --api-key flag")
 
     # Final verdict
     console.print()
