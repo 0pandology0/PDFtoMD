@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.Python
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Test inputs / outputs — the example PDF in this repo is a third-party
+# magazine article kept locally for testing. Don't commit it or its extracted text.
+*.pdf
+*.md
+!README.md
+!REQUIREMENTS.md
