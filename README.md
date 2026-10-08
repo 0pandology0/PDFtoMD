@@ -1,5 +1,7 @@
 # PDF-to-Obsidian Converter
 
+> **DEPRECATED (2026-10-08).** No longer maintained or in use. The repository is archived (read-only).
+
 A high-fidelity PDF → Markdown converter using Claude Vision, with a 3-tier fallback chain (Sonnet → Haiku → Tesseract) so no pages are silently lost. Output is optimized for Obsidian vaults.
 
 ## Why This Tool?
@@ -96,7 +98,7 @@ python pdf_to_md.py convert -i document.pdf -o document.md --force
 | `--output` | `-o` | Required | Path for output Markdown file |
 | `--api-key` | `-k` | env var | Anthropic API key |
 | `--dpi` | `-d` | 300 | Image resolution (72–600). Higher = better OCR, slower |
-| `--model` | `-m` | `claude-sonnet-4-6` | Primary Claude model. Fallback model is hardcoded at the top of `pdf_to_md.py` |
+| `--mode` |  | `sonnet` | Quality tier chain: `sonnet` (Sonnet→Haiku→Tesseract), `haiku` (Haiku→Tesseract), or `tesseract` (Tesseract only). |
 | `--context-words` | `-c` | 50 | Words passed between pages for sentence-continuity hints |
 | `--force` | `-f` | False | Overwrite existing output without prompting |
 
@@ -105,6 +107,35 @@ python pdf_to_md.py convert -i document.pdf -o document.md --force
 ```bash
 python pdf_to_md.py test-setup
 ```
+
+## Web UI
+
+There's also a local web frontend — drag-drop a PDF, pick a quality tier, watch per-page progress live, download the `.md` when done.
+
+```bash
+python web.py
+# → http://127.0.0.1:8000
+```
+
+It's a single-process FastAPI app served on `127.0.0.1` only (no auth, single user). Uploaded PDFs and generated Markdown live in `$TMPDIR/pdftomd-jobs/<job_id>/`; nothing is persisted across server restarts.
+
+The UI exposes three quality tiers as cards:
+
+| Card | Tier chain | Use when |
+|---|---|---|
+| **TESSERACT** | `tesseract` only | You want speed and don't need structure detection, or you have no API key. |
+| **HAIKU + TESSERACT** | `claude-haiku-4-5-20251001` → `tesseract` | Default for most documents. Cheaper than Sonnet and sidesteps Sonnet's heavy refusal rate on copyrighted editorial. |
+| **FULL SONNET** | `claude-sonnet-4-6` → `claude-haiku-4-5-20251001` → `tesseract` | You want the highest-fidelity tier first. Expect many fallbacks on copyrighted material. |
+
+Settings the UI exposes under "Advanced": DPI (150–600) and context words (0–100). Same semantics as the CLI flags.
+
+The page reads `/api/health` on load and grays out the two Claude tiers if `ANTHROPIC_API_KEY` isn't set on the server. Tesseract-only mode runs without a key.
+
+### Web UI architecture (quick reference)
+
+- `web.py` — FastAPI app. Routes: `POST /api/convert` (multipart upload, returns `{job_id}`), `GET /api/jobs/{id}/events` (Server-Sent Events stream of `started` / `page-done` / `completed` / `error`), `GET /api/jobs/{id}/result` (downloads the .md), `GET /api/health`.
+- `web/index.html`, `web/styles.css`, `web/app.js` — neo-brutalist single-page frontend, no build step. Tailwind is *not* used; styles are vanilla CSS with custom design tokens.
+- Pages are rendered **one at a time** by poppler inside the OCR loop (not all-at-once up front). This means progress events start arriving immediately instead of after a multi-minute black hole on large PDFs.
 
 ## How It Works
 

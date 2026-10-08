@@ -29,8 +29,10 @@ import io
 import os
 import sys
 import shutil
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import typer
 from rich.console import Console
@@ -209,41 +211,34 @@ def clean_page_join(accumulated_text: str, new_page_text: str) -> str:
 # CORE CONVERSION LOGIC
 # =============================================================================
 
-def convert_pdf_to_images(pdf_path: Path, dpi: int = 300):
+def convert_pdf_to_images(
+    pdf_path: Path,
+    dpi: int = 300,
+    first_page: Optional[int] = None,
+    last_page: Optional[int] = None,
+):
     """
-    Convert a PDF file to a list of PIL Image objects.
+    Render PDF pages to PIL Images. If first_page/last_page are given, only that
+    range is rendered (used for page-by-page streaming).
 
-    Args:
-        pdf_path: Path to the PDF file.
-        dpi: Resolution for image conversion (default: 300 for high fidelity).
-
-    Returns:
-        list: List of PIL Image objects, one per page.
-
-    Raises:
-        ImportError: If pdf2image is not installed.
-        Exception: If PDF conversion fails.
+    Raises ImportError if pdf2image is missing; lets other exceptions propagate.
     """
-    try:
-        from pdf2image import convert_from_path
-    except ImportError:
-        console.print("[red]Error: pdf2image is not installed.[/red]")
-        console.print("Install it with: pip install pdf2image")
-        raise typer.Exit(code=1)
+    from pdf2image import convert_from_path
+    return convert_from_path(
+        pdf_path,
+        dpi=dpi,
+        fmt="png",
+        first_page=first_page,
+        last_page=last_page,
+        thread_count=1,  # parallel pdftoppm processes don't help — empirically same speed
+    )
 
-    try:
-        # Convert PDF to images at specified DPI
-        # Using PNG format internally for best quality
-        images = convert_from_path(
-            pdf_path,
-            dpi=dpi,
-            fmt="png",
-            thread_count=4,  # Use multiple threads for faster conversion
-        )
-        return images
-    except Exception as e:
-        console.print(f"[red]Error converting PDF to images: {e}[/red]")
-        raise typer.Exit(code=1)
+
+def get_pdf_page_count(pdf_path: Path) -> int:
+    """Read just the PDF metadata to get the page count. Much faster than rendering."""
+    from pdf2image.pdf2image import pdfinfo_from_path
+    info = pdfinfo_from_path(str(pdf_path))
+    return int(info["Pages"])
 
 
 # Fallback chain: Claude Vision can fail two ways on copyrighted editorial content:
@@ -340,59 +335,231 @@ def _call_tesseract(image) -> str:
 
 
 def extract_text_from_image(
-    client,
     image,
     page_num: int,
     total_pages: int,
+    tiers: list[str],
     previous_context: Optional[str] = None,
-    model: str = "claude-sonnet-4-6",
-    fallback_model: str = FALLBACK_MODEL,
+    client=None,
 ) -> tuple[str, str]:
     """
-    Extract text from a page image with a 3-tier fallback chain:
+    Try each tier in order; return on the first one that produces non-refusal text.
 
-    1. Primary Claude model (high fidelity, but its response filter can hard-block
-       editorial content that mentions sensitive subjects).
-    2. Fallback Claude model — empirically Haiku 4.5 passes content Sonnet/Opus reject.
-    3. Tesseract — last resort, lower fidelity but no content filter.
+    `tiers` is an ordered list of engine identifiers. Each entry is either:
+      - A Claude model ID (e.g. "claude-sonnet-4-6"). Requires `client`.
+      - The string "tesseract". Uses pytesseract locally.
 
-    Returns: (text, engine_used) where engine_used is the model ID or "tesseract".
+    Claude tiers are subject to refusal detection — soft refusals (the response is
+    a summary or "I can't reproduce this copyrighted text" rather than OCR) and
+    hard content-filter errors both trigger a fall-through to the next tier.
+    Tesseract has no content awareness and effectively always returns text.
+
+    Returns: (text, engine_used). engine_used is the tier string that succeeded,
+    or "error" if every tier failed.
     """
-    image_data = image_to_base64(image)
+    # Lazy: only build the image bytes / prompt once we know we have a Claude tier.
+    image_data: Optional[str] = None
+    prompt: Optional[str] = None
 
-    prompt = SYSTEM_PROMPT
-    if previous_context:
-        prompt += CONTEXT_CONTINUATION_PROMPT.format(last_words=previous_context)
+    for tier in tiers:
+        if tier == "tesseract":
+            try:
+                text = _call_tesseract(image)
+                return text, "tesseract"
+            except Exception as exc:
+                console.print(f"[red]Page {page_num}: Tesseract failed ({exc}).[/red]")
+                continue
 
-    # Tier 1: primary model
+        # Claude model tier
+        if client is None:
+            console.print(f"[red]Page {page_num}: no Anthropic client; skipping {tier}.[/red]")
+            continue
+        if image_data is None:
+            image_data = image_to_base64(image)
+            prompt = SYSTEM_PROMPT
+            if previous_context:
+                prompt += CONTEXT_CONTINUATION_PROMPT.format(last_words=previous_context)
+        try:
+            text = _call_claude_vision(client, image_data, prompt, tier)
+            if not _looks_like_refusal(text):
+                return text, tier
+            console.print(f"[yellow]Page {page_num}: {tier} returned a refusal/summary; trying next tier.[/yellow]")
+        except Exception as exc:
+            if not _is_content_filter_error(exc):
+                console.print(f"[yellow]Page {page_num}: {tier} error ({exc}); trying next tier.[/yellow]")
+
+    console.print(f"[red]Page {page_num}: all OCR tiers failed.[/red]")
+    return f"[Error extracting page {page_num}: all OCR tiers failed]", "error"
+
+
+# =============================================================================
+# PROGRAMMATIC API
+# =============================================================================
+# `run_conversion` is the orchestration entry point. Both the CLI (below) and the
+# web UI (`web.py`) call into it. The CLI passes a callback that updates a Rich
+# progress bar; the web UI passes one that pushes events onto an asyncio queue
+# for streaming over SSE.
+# =============================================================================
+
+
+MODE_TIERS: dict[str, list[str]] = {
+    "tesseract": ["tesseract"],
+    "haiku": ["claude-haiku-4-5-20251001", "tesseract"],
+    "sonnet": ["claude-sonnet-4-6", FALLBACK_MODEL, "tesseract"],
+}
+
+
+def _mode_to_tiers(mode: str) -> list[str]:
     try:
-        text = _call_claude_vision(client, image_data, prompt, model)
-        if not _looks_like_refusal(text):
-            return text, model
-        console.print(f"[yellow]Page {page_num}: {model} returned a refusal/summary; trying {fallback_model}.[/yellow]")
-    except Exception as primary_exc:
-        if not _is_content_filter_error(primary_exc):
-            console.print(f"[yellow]Page {page_num}: {model} error ({primary_exc}); trying {fallback_model}.[/yellow]")
+        return MODE_TIERS[mode]
+    except KeyError:
+        raise ValueError(
+            f"Unknown mode {mode!r}. Use one of: {', '.join(MODE_TIERS)}"
+        )
 
-    # Tier 2: fallback Claude model
-    try:
-        text = _call_claude_vision(client, image_data, prompt, fallback_model)
-        if not _looks_like_refusal(text):
-            console.print(f"[yellow]Page {page_num}: recovered via {fallback_model}.[/yellow]")
-            return text, fallback_model
-        console.print(f"[yellow]Page {page_num}: {fallback_model} also refused; falling back to Tesseract.[/yellow]")
-    except Exception as fallback_exc:
-        if not _is_content_filter_error(fallback_exc):
-            console.print(f"[yellow]Page {page_num}: {fallback_model} error ({fallback_exc}); falling back to Tesseract.[/yellow]")
 
-    # Tier 3: Tesseract
-    try:
-        text = _call_tesseract(image)
-        console.print(f"[yellow]Page {page_num}: Claude refused → recovered via Tesseract (lower fidelity).[/yellow]")
-        return text, "tesseract"
-    except Exception as tesseract_exc:
-        console.print(f"[red]Page {page_num}: all OCR engines failed ({tesseract_exc}).[/red]")
-        return f"[Error extracting page {page_num}: all OCR engines failed]", "error"
+def _build_provenance_header(
+    engine_by_page: dict[int, str],
+    primary_engine: str,
+) -> str:
+    """HTML comment listing pages that fell back from the primary engine.
+
+    Empty string when every page used the primary engine (no provenance to record).
+    """
+    engine_pages: dict[str, list[int]] = {}
+    for page_num, engine in engine_by_page.items():
+        engine_pages.setdefault(engine, []).append(page_num)
+    fallback_pages = {e: p for e, p in engine_pages.items() if e != primary_engine}
+    if not fallback_pages:
+        return ""
+    lines = ["<!--", "pdf_to_md provenance — pages using fallback engines:"]
+    for engine, pages in fallback_pages.items():
+        lines.append(f"  {engine}: {sorted(pages)}")
+    lines.append("-->")
+    return "\n".join(lines) + "\n\n"
+
+
+@dataclass
+class ConversionResult:
+    markdown: str                       # full output, including provenance header
+    engine_by_page: dict[int, str]      # 1-indexed page → engine that produced it
+    total_pages: int
+    word_count: int                     # word count of body text (excludes header)
+    char_count: int                     # char count of body text (excludes header)
+    mode: str
+    tiers: list[str] = field(default_factory=list)
+
+
+# Progress callback event shape (loose dict for cross-process JSON friendliness):
+#   {"type": "started",   "total_pages": int, "mode": str}
+#   {"type": "page-done", "page": int, "engine": str, "elapsed_ms": int,
+#                         "total_pages": int}
+#   {"type": "completed", "engine_by_page": dict, "total_pages": int,
+#                         "word_count": int, "char_count": int}
+ProgressCallback = Callable[[dict], None]
+
+
+def run_conversion(
+    pdf_path: Path,
+    mode: str = "sonnet",
+    dpi: int = 300,
+    context_words: int = 50,
+    api_key: Optional[str] = None,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> ConversionResult:
+    """
+    Convert a PDF to Markdown using the specified mode's tier chain.
+
+    `mode` is one of "tesseract" | "haiku" | "sonnet" — see MODE_TIERS.
+
+    `progress_callback`, if given, receives lifecycle dicts (see comment above).
+    Callback exceptions are swallowed so a flaky observer can't corrupt the run.
+
+    Raises:
+        ValueError on unknown mode or missing API key when needed.
+        Exception from `convert_pdf_to_images` on bad input.
+    """
+    tiers = _mode_to_tiers(mode)
+    needs_claude = any(t != "tesseract" for t in tiers)
+
+    def emit(event: dict) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(event)
+        except Exception:
+            # A misbehaving observer must never break the conversion itself.
+            pass
+
+    # Lazy: only resolve / construct an Anthropic client if a Claude tier is in play.
+    client = None
+    if needs_claude:
+        resolved_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        if not resolved_key:
+            raise ValueError(
+                "ANTHROPIC_API_KEY is required for modes that use Claude "
+                f"(mode={mode!r}, tiers={tiers}). Use mode='tesseract' to skip Claude."
+            )
+        import anthropic
+        client = anthropic.Anthropic(api_key=resolved_key)
+
+    # Cheap metadata read so the consumer knows the total up front. The actual
+    # rendering happens lazily, one page at a time, inside the OCR loop — that
+    # lets the UI show progress from page 1 instead of staring at a black box
+    # while a multi-minute full-PDF render finishes.
+    total_pages = get_pdf_page_count(pdf_path)
+    emit({"type": "started", "total_pages": total_pages, "mode": mode})
+
+    accumulated_text = ""
+    previous_context: Optional[str] = None
+    engine_by_page: dict[int, str] = {}
+
+    for page_num in range(1, total_pages + 1):
+        page_start = time.monotonic()
+        rendered = convert_pdf_to_images(
+            pdf_path, dpi=dpi, first_page=page_num, last_page=page_num
+        )
+        image = rendered[0]
+        page_text, engine = extract_text_from_image(
+            image=image,
+            page_num=page_num,
+            total_pages=total_pages,
+            tiers=tiers,
+            previous_context=previous_context if context_words > 0 else None,
+            client=client,
+        )
+        elapsed_ms = int((time.monotonic() - page_start) * 1000)
+        engine_by_page[page_num] = engine
+        accumulated_text = clean_page_join(accumulated_text, page_text)
+        if context_words > 0:
+            previous_context = get_last_n_words(page_text, context_words)
+        emit({
+            "type": "page-done",
+            "page": page_num,
+            "engine": engine,
+            "elapsed_ms": elapsed_ms,
+            "total_pages": total_pages,
+        })
+
+    provenance_header = _build_provenance_header(engine_by_page, primary_engine=tiers[0])
+    markdown = provenance_header + accumulated_text
+    result = ConversionResult(
+        markdown=markdown,
+        engine_by_page=engine_by_page,
+        total_pages=total_pages,
+        word_count=len(accumulated_text.split()),
+        char_count=len(accumulated_text),
+        mode=mode,
+        tiers=tiers,
+    )
+    emit({
+        "type": "completed",
+        "engine_by_page": engine_by_page,
+        "total_pages": total_pages,
+        "word_count": result.word_count,
+        "char_count": result.char_count,
+    })
+    return result
 
 
 # =============================================================================
@@ -432,10 +599,10 @@ def convert(
         min=72,
         max=600,
     ),
-    model: str = typer.Option(
-        "claude-sonnet-4-6",
-        "--model", "-m",
-        help="Claude model to use for OCR.",
+    mode: str = typer.Option(
+        "sonnet",
+        "--mode",
+        help="Quality tier chain: 'sonnet' (Sonnet→Haiku→Tesseract), 'haiku' (Haiku→Tesseract), or 'tesseract' (Tesseract only).",
     ),
     context_words: int = typer.Option(
         50,
@@ -453,162 +620,104 @@ def convert(
     """
     Convert a PDF document to Obsidian-optimized Markdown.
 
-    This tool uses Claude Vision API to perform high-fidelity OCR,
-    preserving complex layouts, footnotes, and typography.
+    Uses a 3-tier fallback chain (Claude Sonnet → Haiku → Tesseract) by default,
+    with refusal detection so soft-refusals fall through to the next tier.
 
     Example:
-        python pdf_to_md.py -i document.pdf -o document.md
+        python pdf_to_md.py convert -i document.pdf -o document.md
     """
 
-    # ==========================================================================
-    # STEP 1: Environment Checks
-    # ==========================================================================
-
+    # ----- Environment checks (CLI-only nicety) -----
     console.print(Panel(
         "[bold blue]PDF-to-Obsidian Converter[/bold blue]\n"
-        "High-fidelity OCR using Claude Vision API",
+        f"Mode: {mode}",
         title="Starting Conversion"
     ))
 
-    # Check for poppler
     if not check_poppler_installed():
         console.print(Panel(
             "[red bold]poppler-utils is not installed![/red bold]\n\n"
-            "This tool requires poppler for PDF processing.\n\n"
-            "[yellow]Installation instructions:[/yellow]\n"
             "  • Ubuntu/Debian: sudo apt-get install poppler-utils\n"
             "  • macOS: brew install poppler\n"
-            "  • Windows: Download from https://github.com/oschwartz10612/poppler-windows/releases",
+            "  • Windows: see https://github.com/oschwartz10612/poppler-windows/releases",
             title="Missing Dependency"
         ))
         raise typer.Exit(code=1)
-
     console.print("[green]✓[/green] poppler-utils detected")
 
-    # Check output file
     if output_path.exists() and not force:
         if not Confirm.ask(f"Output file {output_path} exists. Overwrite?"):
             console.print("[yellow]Aborted.[/yellow]")
             raise typer.Exit(code=0)
 
-    # Get API key
-    resolved_api_key = get_api_key(api_key)
-    console.print("[green]✓[/green] API key configured")
-
-    # Initialize Anthropic client
+    # ----- Resolve API key only if a Claude tier will be used -----
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=resolved_api_key)
-    except ImportError:
-        console.print("[red]Error: anthropic library is not installed.[/red]")
-        console.print("Install it with: pip install anthropic")
-        raise typer.Exit(code=1)
-    except Exception as e:
-        console.print(f"[red]Error initializing Anthropic client: {e}[/red]")
+        tiers = _mode_to_tiers(mode)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
         raise typer.Exit(code=1)
 
-    console.print("[green]✓[/green] Anthropic client initialized")
+    resolved_api_key: Optional[str] = None
+    if any(t != "tesseract" for t in tiers):
+        resolved_api_key = get_api_key(api_key)
+        console.print("[green]✓[/green] API key configured")
 
-    # ==========================================================================
-    # STEP 2: Convert PDF to Images
-    # ==========================================================================
-
-    console.print(f"\n[bold]Converting PDF to images at {dpi} DPI...[/bold]")
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Converting PDF pages...", total=None)
-        images = convert_pdf_to_images(input_path, dpi=dpi)
-        progress.update(task, completed=True)
-
-    total_pages = len(images)
-    console.print(f"[green]✓[/green] Converted {total_pages} page(s) to images")
-
-    # ==========================================================================
-    # STEP 3: OCR Each Page with Claude
-    # ==========================================================================
-
-    console.print(f"\n[bold]Extracting text using {model}...[/bold]")
-
-    accumulated_text = ""
-    previous_context = None
-    # Track which engine produced each page so we can surface fidelity info at the end.
-    engine_by_page: dict[int, str] = {}
-
-    with Progress(
+    # ----- Run conversion with a Rich progress bar driven by the callback -----
+    progress = Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TaskProgressColumn(),
         console=console,
-    ) as progress:
-        task = progress.add_task("Processing pages", total=total_pages)
+    )
 
-        for i, image in enumerate(images):
-            page_num = i + 1
-            progress.update(task, description=f"Scanning page {page_num} of {total_pages}...")
+    state = {"task": None}
 
-            page_text, engine = extract_text_from_image(
-                client=client,
-                image=image,
-                page_num=page_num,
-                total_pages=total_pages,
-                previous_context=previous_context if context_words > 0 else None,
-                model=model,
+    def cli_progress_callback(event: dict) -> None:
+        et = event.get("type")
+        if et == "started":
+            state["task"] = progress.add_task(
+                f"Scanning {event['total_pages']} pages...",
+                total=event["total_pages"],
             )
-            engine_by_page[page_num] = engine
+        elif et == "page-done":
+            engine_short = event["engine"].split("-")[1] if event["engine"].startswith("claude-") else event["engine"]
+            progress.update(
+                state["task"],
+                advance=1,
+                description=f"Page {event['page']}/{event['total_pages']} via {engine_short}",
+            )
 
-            accumulated_text = clean_page_join(accumulated_text, page_text)
+    try:
+        with progress:
+            result = run_conversion(
+                pdf_path=input_path,
+                mode=mode,
+                dpi=dpi,
+                context_words=context_words,
+                api_key=resolved_api_key,
+                progress_callback=cli_progress_callback,
+            )
+    except Exception as e:
+        console.print(f"[red]Conversion failed: {e}[/red]")
+        raise typer.Exit(code=1)
 
-            if context_words > 0:
-                previous_context = get_last_n_words(page_text, context_words)
+    console.print(f"[green]✓[/green] Extracted text from all {result.total_pages} pages")
 
-            progress.update(task, advance=1)
-
-    console.print(f"[green]✓[/green] Extracted text from all {total_pages} pages")
-
-    # ==========================================================================
-    # STEP 4: Save Output
-    # ==========================================================================
-
-    console.print(f"\n[bold]Saving to {output_path}...[/bold]")
-
-    # Build engine summary (pages grouped by engine, with primary model first).
-    engine_pages: dict[str, list[int]] = {}
-    for page_num, engine in engine_by_page.items():
-        engine_pages.setdefault(engine, []).append(page_num)
-
-    fallback_pages = {e: p for e, p in engine_pages.items() if e != model}
-    provenance_header = ""
-    if fallback_pages:
-        # HTML comment is invisible in Obsidian's rendered view but searchable in source.
-        lines = ["<!--", "pdf_to_md provenance — pages using fallback engines:"]
-        for engine, pages in fallback_pages.items():
-            lines.append(f"  {engine}: {sorted(pages)}")
-        lines.append("-->")
-        provenance_header = "\n".join(lines) + "\n\n"
-
+    # ----- Save output -----
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write(provenance_header + accumulated_text)
-
+            f.write(result.markdown)
         console.print(f"[green]✓[/green] Saved Markdown to {output_path}")
-
     except Exception as e:
         console.print(f"[red]Error saving file: {e}[/red]")
         raise typer.Exit(code=1)
 
-    # ==========================================================================
-    # DONE
-    # ==========================================================================
-
-    word_count = len(accumulated_text.split())
-    char_count = len(accumulated_text)
-
+    # ----- Summary panel -----
+    engine_pages: dict[str, list[int]] = {}
+    for page_num, engine in result.engine_by_page.items():
+        engine_pages.setdefault(engine, []).append(page_num)
     engine_lines = "\n".join(
         f"[dim]{engine}:[/dim] {len(pages)} page(s) — {sorted(pages)}"
         for engine, pages in engine_pages.items()
@@ -618,9 +727,10 @@ def convert(
         f"[green bold]Conversion Complete![/green bold]\n\n"
         f"[dim]Input:[/dim]  {input_path.name}\n"
         f"[dim]Output:[/dim] {output_path.name}\n"
-        f"[dim]Pages:[/dim]  {total_pages}\n"
-        f"[dim]Words:[/dim]  {word_count:,}\n"
-        f"[dim]Chars:[/dim]  {char_count:,}\n\n"
+        f"[dim]Mode:[/dim]   {result.mode}\n"
+        f"[dim]Pages:[/dim]  {result.total_pages}\n"
+        f"[dim]Words:[/dim]  {result.word_count:,}\n"
+        f"[dim]Chars:[/dim]  {result.char_count:,}\n\n"
         f"[bold]Engine usage:[/bold]\n{engine_lines}",
         title="Summary"
     ))

@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PDFtoMD</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <h1 class="hero-title">PDFtoMD</h1>
+      <p class="hero-sub">Drop a PDF. Get a Markdown file.</p>
+      <p id="health-banner" class="banner banner-warn hidden"></p>
+    </header>
+
+    <!-- ====== VIEW: IDLE / READY ====== -->
+    <section id="view-idle" class="view">
+      <form id="upload-form">
+        <!-- Drop zone -->
+        <div class="block">
+          <label for="file-input" id="drop-zone" class="drop-zone" tabindex="0">
+            <input type="file" id="file-input" name="file" accept="application/pdf,.pdf" hidden>
+            <div id="drop-empty" class="drop-empty">
+              <div class="drop-icon">▢</div>
+              <div class="drop-headline">DROP PDF HERE</div>
+              <div class="drop-sub">or click to browse</div>
+            </div>
+            <div id="drop-filled" class="drop-filled hidden">
+              <div class="file-name" id="file-name">—</div>
+              <div class="file-meta" id="file-meta">—</div>
+              <button type="button" id="file-clear" class="link-btn">change file</button>
+            </div>
+          </label>
+        </div>
+
+        <!-- Mode picker -->
+        <h2 class="section-title">Quality tier</h2>
+        <div class="mode-grid">
+          <label class="mode-card" data-mode-card="tesseract">
+            <input type="radio" name="mode" value="tesseract" hidden>
+            <div class="mode-tag mode-tag-tesseract">TESSERACT</div>
+            <div class="mode-name">Fastest</div>
+            <p class="mode-desc">Local OCR only. No API. Seconds per page. Lowest fidelity, no structure detection.</p>
+          </label>
+
+          <label class="mode-card mode-card-selected" data-mode-card="haiku">
+            <input type="radio" name="mode" value="haiku" hidden checked>
+            <div class="mode-tag mode-tag-haiku">HAIKU + TESSERACT</div>
+            <div class="mode-name">Balanced</div>
+            <p class="mode-desc">Claude Haiku 4.5 primary, Tesseract fallback. Cheaper than Sonnet. Skips most copyright refusals.</p>
+          </label>
+
+          <label class="mode-card" data-mode-card="sonnet">
+            <input type="radio" name="mode" value="sonnet" hidden>
+            <div class="mode-tag mode-tag-sonnet">FULL SONNET</div>
+            <div class="mode-name">Max fidelity</div>
+            <p class="mode-desc">Sonnet 4.6 → Haiku 4.5 → Tesseract. Best for clean layouts. Sonnet refuses copyrighted material often.</p>
+          </label>
+        </div>
+
+        <!-- Advanced -->
+        <details class="advanced">
+          <summary class="advanced-summary">Advanced</summary>
+          <div class="advanced-body">
+            <label class="field">
+              <div class="field-label">
+                <span>DPI</span>
+                <span class="field-value" id="dpi-value">300</span>
+              </div>
+              <input type="range" id="dpi" name="dpi" min="150" max="600" step="50" value="300">
+              <div class="field-hint">Image resolution. Higher = sharper OCR, slower.</div>
+            </label>
+
+            <label class="field">
+              <div class="field-label">
+                <span>Context words</span>
+                <span class="field-value" id="context-value">50</span>
+              </div>
+              <input type="range" id="context_words" name="context_words" min="0" max="100" step="5" value="50">
+              <div class="field-hint">Words passed between pages to bridge sentence breaks. 0 disables.</div>
+            </label>
+          </div>
+        </details>
+
+        <button type="submit" id="convert-btn" class="btn btn-primary btn-big" disabled>
+          CONVERT →
+        </button>
+      </form>
+    </section>
+
+    <!-- ====== VIEW: PROCESSING ====== -->
+    <section id="view-processing" class="view hidden">
+      <div class="block">
+        <div class="block-header">
+          <div>
+            <div class="block-label">CONVERTING</div>
+            <div class="block-title" id="processing-filename">—</div>
+          </div>
+          <div class="mono pill" id="processing-mode">—</div>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="progress-fill" style="width: 0%"></div>
+        </div>
+        <div class="progress-meta">
+          <span id="progress-count" class="mono">0 / 0</span>
+          <span id="progress-eta" class="mono dim">—</span>
+        </div>
+      </div>
+
+      <h2 class="section-title">Per-page log</h2>
+      <ol id="page-log" class="page-log"></ol>
+    </section>
+
+    <!-- ====== VIEW: DONE ====== -->
+    <section id="view-done" class="view hidden">
+      <div class="block done-summary">
+        <div class="block-label">DONE</div>
+        <div class="block-title" id="done-filename">—</div>
+        <div class="done-stats">
+          <div class="stat">
+            <div class="stat-value mono" id="done-pages">—</div>
+            <div class="stat-label">pages</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value mono" id="done-words">—</div>
+            <div class="stat-label">words</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value mono" id="done-chars">—</div>
+            <div class="stat-label">chars</div>
+          </div>
+        </div>
+      </div>
+
+      <h2 class="section-title">Engine breakdown</h2>
+      <div id="engine-breakdown" class="engine-breakdown"></div>
+
+      <h2 class="section-title">Preview</h2>
+      <pre id="preview" class="preview mono"></pre>
+
+      <div class="done-actions">
+        <a id="download-btn" class="btn btn-primary btn-big" download>DOWNLOAD .MD</a>
+        <button type="button" id="reset-btn" class="btn btn-secondary btn-big">CONVERT ANOTHER</button>
+      </div>
+    </section>
+
+    <!-- ====== VIEW: ERROR ====== -->
+    <section id="view-error" class="view hidden">
+      <div class="block block-error">
+        <div class="block-label">ERROR</div>
+        <p id="error-message" class="error-message">—</p>
+        <button type="button" id="error-retry" class="btn btn-primary">TRY AGAIN</button>
+      </div>
+    </section>
+
+    <footer class="page-footer mono dim">
+      runs locally · uses ANTHROPIC_API_KEY env var · pdfs are not retained
+    </footer>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

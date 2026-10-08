@@ -19,3 +19,9 @@ Pillow>=10.0.0
 # Tesseract OCR wrapper (requires tesseract system package) — last-resort fallback
 # when Claude blocks a page via its response content-filtering policy.
 pytesseract>=0.3.10
+
+# Web UI — `python web.py` starts a local FastAPI server with a drag-and-drop frontend.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+sse-starlette>=2.0
